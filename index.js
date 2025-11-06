@@ -2,6 +2,7 @@ import express from "express";
 import Stripe from "stripe";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
+import {sendMail} from "./mail.js";
 
 dotenv.config();
 const app = express();
@@ -137,6 +138,7 @@ app.get("/", (req, res) => {
  */
 app.post("/api/setup-accounts", async (req, res) => {
     try {
+        console.log('>>>req', req.body)
         const driver = await stripe.accounts.create({
             type: "express",
             capabilities: {
@@ -184,28 +186,70 @@ app.post("/api/setup-accounts", async (req, res) => {
 });
 
 /**
+ * 카드 등록 setup API
+ */
+app.post('/api/setup-intent', async (req, res) => {
+    // Use an existing Customer ID if this is a returning customer.
+    let customer_id = req.body?.customer_id || null;
+    if (!customer_id) {
+        const customer = await stripe.customers.create({
+            description: "Guest Checkout - No Login",
+        });
+        customer_id = customer.id
+    }
+
+    const setupIntent = await stripe.setupIntents.create({
+        payment_method_types: ['card'],
+        customer: customer_id,
+    });
+
+    res.json({
+        clientSecret: setupIntent.client_secret,
+        customer_id,
+    });
+});
+
+/* 카드 목록 조회 */
+app.post("/api/list-cards", async (req, res) => {
+    const {customerId} = req.body;
+    const methods = await stripe.paymentMethods.list({
+        customer: customerId,
+        type: "card",
+    });
+    res.json(methods.data);
+});
+
+/**
  * 2️⃣ 고객 결제 (로그인 없이)
  */
 app.post("/api/checkout", async (req, res) => {
-    const {amount = 10000, currency = "cad", driver_account_id, truck_account_id} = req.body;
+    const {
+        amount = 10000,
+        currency = "cad",
+        payment_method_id,
+        customer_id,
+        driver_account_id,
+        truck_account_id
+    } = req.body;
+
+    if (!payment_method_id) {
+        return res.status(400).json({error: "Missing payment_method_id IDs"});
+    }
+
+    if (!customer_id) {
+        return res.status(400).json({error: "Missing customer account IDs"});
+    }
 
     if (!driver_account_id || !truck_account_id) {
         return res.status(400).json({error: "Missing driver/truck account IDs"});
     }
 
+    const customer = await stripe.customers.retrieve(customer_id);
+    console.log(customer.email); // ⚠️ 없으면 안 보냄
+
     try {
-        // ⚙️ Stripe에서 익명 고객용 Customer 객체 생성 (로그인 없음)
-        const customer = await stripe.customers.create({
-            description: "Guest Checkout - No Login",
-        });
 
-        // 테스트 카드 (Stripe test mode)
-        const paymentMethod = await stripe.paymentMethods.create({
-            type: "card",
-            card: {token: "tok_visa"},
-        });
-
-        await stripe.paymentMethods.attach(paymentMethod.id, {customer: customer.id});
+        await stripe.paymentMethods.attach(payment_method_id, {customer: customer_id});
 
         const platformFee = Math.round(amount * 0.3); // 젤팔라 15%
 
@@ -213,12 +257,39 @@ app.post("/api/checkout", async (req, res) => {
         console.log(`amount:`, amount)
         console.log(`PlatformFee:`, platformFee)
 
+        // 1️⃣ 기존 customer로 invoice 생성
+        const invoice = await stripe.invoices.create({
+            customer: customer_id,
+            auto_advance: false, // 결제는 이미 되었으므로
+            collection_method: "send_invoice", // 고객에게 영수증만 전송
+            days_until_due: 0, // 즉시 발행 (이미 결제 완료 건)
+        });
+
+        // 2️⃣ line items 추가
+        await stripe.invoiceItems.create({
+            customer: customer_id,
+            invoice: invoice.id,
+            description: "Delivery Fee",
+            amount: amount,
+            currency: "cad",
+        });
+
+        await stripe.invoiceItems.create({
+            customer: customer_id,
+            invoice: invoice.id,
+            description: "HST (13%)",
+            amount: Math.round(amount * 0.13),
+            currency: "cad",
+        });
+
+        const finalized = await stripe.invoices.finalizeInvoice(invoice.id);
+
         // ✅ 드라이버 명의 결제
         const pi = await stripe.paymentIntents.create({
             amount,
             currency,
-            customer: customer.id,
-            payment_method: paymentMethod.id,
+            customer: customer_id,
+            payment_method: payment_method_id,
             confirm: true,
             automatic_payment_methods: {enabled: true, allow_redirects: "never"},
 
@@ -230,42 +301,35 @@ app.post("/api/checkout", async (req, res) => {
             application_fee_amount: platformFee,
 
             transfer_group: `order_${Date.now()}`,
-            metadata: {
-                driver_account_id,
-                truck_account_id,
-            },
             description: "Jelpala Delivery Service",
+            metadata: {
+                invoice_id: finalized.id,
+            }
         });
 
-        console.log(pi)
+        /* 실제 결제가 처리되는건아니고 다른곳에서 진행되었다고 표기*/
+        await stripe.invoices.pay(finalized.id, { paid_out_of_band: true });
+
+        await sendMail({
+            to: "sayyou0918@gmail.com",
+            subject: "Your Jelpala Delivery Receipt",
+            html: `
+    <h2>Thank you for your order!</h2>
+    <p>Your invoice has been marked as paid.</p>
+    <a href=${finalized.hosted_invoice_url}>View Receipt</a>
+  `,
+        });
 
         res.json({
             payment_intent_id: pi.id,
             client_secret: pi.client_secret,
+            finalized,
             message: "✅ Payment successful!",
         });
     } catch (err) {
         console.error(err);
         res.status(500).json({error: err.message});
     }
-});
-
-app.post("/api/save-card", async (req, res) => {
-    const customer = await stripe.customers.create({
-        description: "Jelpala user",
-        email: req.body.email,
-    });
-
-    // 고객 카드 등록용 SetupIntent 생성
-    const setupIntent = await stripe.setupIntents.create({
-        customer: customer.id,
-        payment_method_types: ["card"],
-    });
-
-    res.json({
-        client_secret: setupIntent.client_secret,
-        customer_id: customer.id,
-    });
 });
 
 app.listen(process.env.PORT || 4242, () =>

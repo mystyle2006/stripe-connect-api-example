@@ -44,61 +44,148 @@ await stripe.accountLinks.create({
 ```
 
 ## 비회원 카드 등록을 위한 비회원 stripe 등록
-1. 클라이언트에서 전달받은 정보로 비회원 등록 후 카드 연결
-3. 카드 등록 결과와 함께 패키지 정보를 서버에 저장 -> 매칭 
--> 이때 device_id, package 정보와 결제 정보 (customer_id, payment_method_id) 를 함께 넘겨 추후 결제 할 때 사용해야 함
-
+- customer_id 가 있을 경우는 해당 customer_id 사용 없을 경우 비회원 임의 생성
 ```javascript
-// client:  정보 전달
-// 1️⃣ Stripe Customer 생성
-const { package, payment_method_id, email, device_id } = req.body 
-const customer = await stripe.customers.create({
-    description: "Jelpala user",
-    email: req.body.email,
+let customer_id = req.body?.customer_id || null;
+if (!customer_id) {
+    const customer = await stripe.customers.create({
+        description: "Guest Checkout - No Login",
+    });
+    customer_id = customer.id
+}
+
+const setupIntent = await stripe.setupIntents.create({
+    payment_method_types: ['card'],
+    customer: customer_id,
 });
 
-// 2️⃣ 결제수단을 Customer에 attach
-await stripe.paymentMethods.attach(payment_method_id, {
-    customer: customer.id,
-});
-
-// 3️⃣ DB에 저장 (비회원이라면 UUID 기반 guest_id 등으로 연결)
-await db.insert({
-    stripe_customer_id: customer.id,
-    stripe_payment_method_id: payment_method_id,
+res.json({
+    clientSecret: setupIntent.client_secret,
+    customer_id,
 });
 ```
-## 
+
+## 비회원 카드 조회
+```javascript
+const { customerId } = req.body;
+const methods = await stripe.paymentMethods.list({
+    customer: customerId,
+    type: "card",
+});
+res.json(methods.data);
+```
 
 ## 추후 배송 완료 때 결제 처리
 - 참고: stripe 결제 api 는 모두 cent 가 1이기 때문에 (소수점이없음) 
 - ex) 100달러 -> 10000 임
 ```javascript
-const platformFee = Math.round(amount * 0.3); // 젤팔라 15%
+const {
+    amount = 10000,
+    currency = "cad",
+    payment_method_id,
+    customer_id,
+    driver_account_id,
+    truck_account_id
+} = req.body;
 
-// ✅ 드라이버 명의 결제
-const pi = await stripe.paymentIntents.create({
-    amount,
-    currency,
-    customer: customer.id,
-    payment_method: paymentMethod.id,
-    confirm: true,
-    automatic_payment_methods: {enabled: true, allow_redirects: "never"},
+if (!payment_method_id) {
+    return res.status(400).json({error: "Missing payment_method_id IDs"});
+}
 
-    // 핵심: 드라이버 명의 + 드라이버로 바로 정산
-    on_behalf_of: driver_account_id,
-    transfer_data: {destination: driver_account_id},
+if (!customer_id) {
+    return res.status(400).json({error: "Missing customer account IDs"});
+}
 
-    // 젤팔라 수수료
-    application_fee_amount: platformFee,
+if (!driver_account_id || !truck_account_id) {
+    return res.status(400).json({error: "Missing driver/truck account IDs"});
+}
 
-    transfer_group: `order_${Date.now()}`,
-    metadata: {
-        driver_account_id,
-        truck_account_id,
-    },
-    description: "Jelpala Delivery Service",
-});
+const customer = await stripe.customers.retrieve(customer_id);
+console.log(customer.email); // ⚠️ 없으면 안 보냄
+
+try {
+
+    await stripe.paymentMethods.attach(payment_method_id, {customer: customer_id});
+
+    const platformFee = Math.round(amount * 0.3); // 젤팔라 15%
+
+    console.log(`>>> ✅ 결제 내역`)
+    console.log(`amount:`, amount)
+    console.log(`PlatformFee:`, platformFee)
+
+    // 1️⃣ 기존 customer로 invoice 생성
+    const invoice = await stripe.invoices.create({
+        customer: customer_id,
+        auto_advance: false, // 결제는 이미 되었으므로
+        collection_method: "send_invoice", // 고객에게 영수증만 전송
+        days_until_due: 0, // 즉시 발행 (이미 결제 완료 건)
+    });
+
+    // 2️⃣ line items 추가
+    await stripe.invoiceItems.create({
+        customer: customer_id,
+        invoice: invoice.id,
+        description: "Delivery Fee",
+        amount: amount,
+        currency: "cad",
+    });
+
+    await stripe.invoiceItems.create({
+        customer: customer_id,
+        invoice: invoice.id,
+        description: "HST (13%)",
+        amount: Math.round(amount * 0.13),
+        currency: "cad",
+    });
+
+    const finalized = await stripe.invoices.finalizeInvoice(invoice.id);
+
+    // ✅ 드라이버 명의 결제
+    const pi = await stripe.paymentIntents.create({
+        amount,
+        currency,
+        customer: customer_id,
+        payment_method: payment_method_id,
+        confirm: true,
+        automatic_payment_methods: {enabled: true, allow_redirects: "never"},
+
+        // 핵심: 드라이버 명의 + 드라이버로 바로 정산
+        on_behalf_of: driver_account_id,
+        transfer_data: {destination: driver_account_id},
+
+        // 젤팔라 수수료
+        application_fee_amount: platformFee,
+
+        transfer_group: `order_${Date.now()}`,
+        description: "Jelpala Delivery Service",
+        metadata: {
+            invoice_id: finalized.id,
+        }
+    });
+
+    /* 실제 결제가 처리되는건아니고 다른곳에서 진행되었다고 표기*/
+    await stripe.invoices.pay(finalized.id, { paid_out_of_band: true });
+
+    await sendMail({
+        to: "sayyou0918@gmail.com",
+        subject: "Your Jelpala Delivery Receipt",
+        html: `
+    <h2>Thank you for your order!</h2>
+    <p>Your invoice has been marked as paid.</p>
+    <a href=${finalized.hosted_invoice_url}>View Receipt</a>
+  `,
+    });
+
+    res.json({
+        payment_intent_id: pi.id,
+        client_secret: pi.client_secret,
+        finalized,
+        message: "✅ Payment successful!",
+    });
+} catch (err) {
+    console.error(err);
+    res.status(500).json({error: err.message});
+}
 ```
 
 ## 웹훅 세팅
