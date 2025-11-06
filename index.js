@@ -310,6 +310,7 @@ app.post("/api/checkout", async (req, res) => {
         /* 실제 결제가 처리되는건아니고 다른곳에서 진행되었다고 표기*/
         await stripe.invoices.pay(finalized.id, { paid_out_of_band: true });
 
+        /* 실제는 메일이 아닌 message를 활용할 수 있음! */
         await sendMail({
             to: "sayyou0918@gmail.com",
             subject: "Your Jelpala Delivery Receipt",
