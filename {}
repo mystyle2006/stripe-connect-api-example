@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 122
+ETag: W/"7a-qdWCigPJ5vB+s0niYDaJwnTbtpk"
+Date: Fri, 07 Nov 2025 16:25:23 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+

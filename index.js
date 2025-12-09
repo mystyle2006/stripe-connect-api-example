@@ -191,6 +191,7 @@ app.post("/api/setup-accounts", async (req, res) => {
 app.post('/api/setup-intent', async (req, res) => {
     // Use an existing Customer ID if this is a returning customer.
     let customer_id = req.body?.customer_id || null;
+
     if (!customer_id) {
         const customer = await stripe.customers.create({
             description: "Guest Checkout - No Login",
